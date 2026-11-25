@@ -11,9 +11,9 @@ import rasterio.features
 from fastapi import APIRouter, Depends, HTTPException
 from geoalchemy2.shape import from_shape
 from pydantic import BaseModel
-from shapely.geometry import Point, box, shape
+from shapely.geometry import box, shape
 from skimage.transform import resize
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.connection import get_db
@@ -129,7 +129,6 @@ async def analyze_town(req: AnalyzeReq, db: AsyncSession = Depends(get_db)):
         cached_res = await db.execute(cached_stmt)
         cached = cached_res.scalar_one_or_none()
         if cached:
-            bounds = await db.execute(select(func.Box2D(cached.geom)))
             return {
                 "location_name": cached.location_name,
                 "bbox": [],
@@ -201,13 +200,28 @@ async def analyze_town(req: AnalyzeReq, db: AsyncSession = Depends(get_db)):
         delta_lon = (delta_lat * TARGET_ASPECT) / np.cos(np.radians(lat))
         bbox = [lon - delta_lon, lat - delta_lat, lon + delta_lon, lat + delta_lat]
 
+    # Guard against country/continent-scale queries & clamp to valid WGS84 bounds
+    if (bbox[2] - bbox[0]) > 5.0 or (bbox[3] - bbox[1]) > 5.0:
+        raise HTTPException(
+            status_code=400,
+            detail="Region is too large. Please search for a specific city, town, or neighborhood.",
+        )
+
+    bbox = [
+        max(-180.0, bbox[0]),
+        max(-90.0, bbox[1]),
+        min(180.0, bbox[2]),
+        min(90.0, bbox[3]),
+    ]
+
     lat_dist = abs(bbox[3] - bbox[1]) * 111.0
     lon_dist = abs(bbox[2] - bbox[0]) * 111.0 * np.cos(np.radians(lat))
     area_km2 = max(1.0, lat_dist * lon_dist)
 
     # 3. Stream Sentinel-2 COG windows in parallel
-    ndvi_2020_task = get_fast_year_composite(bbox, req.baseline_year, shape=RASTER_SHAPE)
-    ndvi_2024_task = get_fast_year_composite(bbox, req.target_year, shape=RASTER_SHAPE)
+    target_poly = geom_geojson if has_polygon else None
+    ndvi_2020_task = get_fast_year_composite(bbox, req.baseline_year, shape=RASTER_SHAPE, geom_geojson=target_poly)
+    ndvi_2024_task = get_fast_year_composite(bbox, req.target_year, shape=RASTER_SHAPE, geom_geojson=target_poly)
     ndvi_baseline, ndvi_target = await asyncio.gather(ndvi_2020_task, ndvi_2024_task)
 
     if ndvi_baseline.shape != ndvi_target.shape:
@@ -218,7 +232,7 @@ async def analyze_town(req: AnalyzeReq, db: AsyncSession = Depends(get_db)):
     if has_polygon:
         try:
             inv_transform = rasterio.transform.from_bounds(
-                bbox[0], bbox[3], bbox[2], bbox[1], RASTER_WIDTH, RASTER_HEIGHT
+                bbox[0], bbox[1], bbox[2], bbox[3], RASTER_WIDTH, RASTER_HEIGHT
             )
             inside_city = rasterio.features.rasterize(
                 [(geom_geojson, 1)],
@@ -233,9 +247,12 @@ async def analyze_town(req: AnalyzeReq, db: AsyncSession = Depends(get_db)):
         except Exception:
             pass
 
-    total_land_pixels = int(np.count_nonzero(valid_land))
-    foliage_target = (ndvi_target >= 0.28) & valid_land
-    foliage_baseline = (ndvi_baseline >= 0.28) & np.isfinite(ndvi_baseline) & (valid_land if has_polygon else True)
+    # Compare identical cloud-free land pixels across both years
+    valid_both = valid_land & np.isfinite(ndvi_baseline) & (ndvi_baseline > 0.08)
+    total_land_pixels = int(np.count_nonzero(valid_both))
+
+    foliage_target = (ndvi_target >= 0.36) & valid_both
+    foliage_baseline = (ndvi_baseline >= 0.36) & valid_both
 
     green_now = int(np.count_nonzero(foliage_target))
     green_prev = int(np.count_nonzero(foliage_baseline))
@@ -270,10 +287,11 @@ async def analyze_town(req: AnalyzeReq, db: AsyncSession = Depends(get_db)):
         await db.commit()
     except Exception:
         await db.rollback()
-
     return {
         "location_name": display_name,
         "bbox": bbox,
+        "baseline_year": req.baseline_year,
+        "target_year": req.target_year,
         "greenery_coverage_pct": greenery_pct,
         "canopy_change_pct": canopy_shift,
         "total_area_analyzed_km2": area_rounded,
