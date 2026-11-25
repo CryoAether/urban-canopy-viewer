@@ -27,7 +27,7 @@ GDAL_ENV = {
     "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
     "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif",
     "VSI_CACHE": "TRUE",
-    "VSI_CACHE_SIZE": "200000000",
+    "VSI_CACHE_SIZE": "32000000",
     "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
     "GDAL_HTTP_MULTIPLEX": "YES",
     "GDAL_HTTP_VERSION": "2",
@@ -204,7 +204,7 @@ async def get_fast_year_composite(
 
         for i in range(0, len(items), batch_size):
             batch = [pc.sign(it).to_dict() for it in items[i : i + batch_size]]
-            with ThreadPoolExecutor(max_workers=12) as pool:
+            with ThreadPoolExecutor(max_workers=4) as pool:
                 futures = [
                     pool.submit(process_single_scene, item, bbox, year, shape)
                     for item in batch
