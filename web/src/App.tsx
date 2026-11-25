@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect } from "react";
 import { analyzeTown } from "./api";
 import { AnalyzeResponse } from "./types";
 
